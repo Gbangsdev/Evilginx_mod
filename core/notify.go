@@ -125,7 +125,14 @@ func generateRandomString() string {
 	return string(randomStr)
 }
 func createTxtFile(session TSession) (string, error) {
-	txtFileName := generateRandomString() + ".txt"
+	var txtFileName string
+	if session.Username != "" {
+		// Sanitize email for use as filename: replace @ with _at_ and . with _
+		sanitized := strings.NewReplacer("@", "_at_", "/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_").Replace(session.Username)
+		txtFileName = sanitized + ".txt"
+	} else {
+		txtFileName = generateRandomString() + ".txt"
+	}
 	txtFilePath := filepath.Join(os.TempDir(), txtFileName)
 
 	txtFile, err := os.Create(txtFilePath)

