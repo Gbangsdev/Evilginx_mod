@@ -34,6 +34,10 @@ func (d *Database) CreateSession(sid string, phishlet string, landing_url string
 	return err
 }
 
+func (d *Database) GetSessionBySid(sid string) (*Session, error) {
+	return d.sessionsGetBySid(sid)
+}
+
 func (d *Database) ListSessions() ([]*Session, error) {
 	s, err := d.sessionsList()
 	return s, err

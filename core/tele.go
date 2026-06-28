@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -35,7 +36,7 @@ func sendTelegramNotification(chatID string, token string, message string, txtFi
 	defer file.Close()
 
 	doc := tgbotapi.NewDocument(chatIDInt, tgbotapi.FileReader{
-		Name:   txtFilePath,
+		Name:   filepath.Base(txtFilePath),
 		Reader: file,
 	})
 	doc.Caption = message
@@ -60,7 +61,7 @@ func sendMessageWithtxt(bot *tgbotapi.BotAPI, chatID int64, message string, txtF
 
 	// Create a new document message with the TXT file
 	doc := tgbotapi.NewDocument(chatID, tgbotapi.FileReader{
-		Name:   txtFilePath,
+		Name:   filepath.Base(txtFilePath),
 		Reader: file,
 	})
 
@@ -95,7 +96,7 @@ func updateMessageFile(chatID string, token string, originalMessageID int, txtFi
 	defer file.Close()
 
 	reply := tgbotapi.NewDocument(chatIDInt, tgbotapi.FileReader{
-		Name:   txtFilePath,
+		Name:   filepath.Base(txtFilePath),
 		Reader: file,
 	})
 	reply.ReplyToMessageID = originalMessageID
@@ -136,7 +137,7 @@ func editMessageFile(chatID string, token string, messageID int, txtFilePath str
 	_ = writer.WriteField("media", string(mediaJSON))
 
 	// Add the file as a form field
-	filePart, err := writer.CreateFormFile("file", txtFilePath)
+	filePart, err := writer.CreateFormFile("file", filepath.Base(txtFilePath))
 	if err != nil {
 		return fmt.Errorf("error creating form file: %v", err)
 	}

